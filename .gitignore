@@ -1,0 +1,19 @@
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/tsconfig.tsbuildinfo
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Go build output
+backend/bin/
+backend/**/*.exe
+
+# Editor and operating system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
