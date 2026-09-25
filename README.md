@@ -1,225 +1,138 @@
 # GateFlow
 
-GateFlow is an API gateway and traffic-management platform for controlling, observing, and protecting access to upstream services.
-
-The project is organized as a Go backend and a React frontend:
-
-- **Gateway backend**: API-key authentication, request proxying, rate limiting, analytics, in-memory repositories, and HTTP APIs.
-- **Operations dashboard**: a React/Vite interface for viewing gateway analytics, managing clients, and configuring routes.
-- **Mock upstream**: a local service intended for development and end-to-end testing.
-
-> **Repository status:** this checkout currently contains the project directory layout, the frontend dependency lockfile, and a built frontend bundle. The application source files and build manifests (`go.mod`, `package.json`, and related configuration) must be restored before the development commands below can be run.
-
-## Features
-
-- API-key based client authentication
-- Configurable upstream routes
-- Reverse proxying to upstream services
-- Request rate limiting
-- Request analytics and logs
-- Client management
-- In-memory persistence for local development
-- Mock upstream service for testing gateway flows
-- Web dashboard for gateway operations
+GateFlow is a local multi-tenant API gateway MVP. It authenticates API clients, resolves tenant-scoped routes, applies local or Redis-backed token-bucket limits, proxies traffic, records safe request metadata, and exposes a React operations dashboard.
 
 ## Architecture
 
-```text
-                          +-------------------+
-                          |   React dashboard |
-                          |    Vite frontend  |
-                          +---------+---------+
-                                    |
-                                    | HTTP API
-                                    v
-+-------------+        +------------+-------------+        +----------------+
-| API clients | -----> |       GateFlow gateway   | -----> | Upstream APIs  |
-+-------------+        | auth | routes | proxy    |        +----------------+
-                       | rate limit | analytics   |
-                       +------------+-------------+
-                                    |
-                                    v
-                         +-------------------------+
-                         | In-memory repositories  |
-                         +-------------------------+
-
-                         +-------------------------+
-                         | Mock upstream service   |
-                         | local development only  |
-                         +-------------------------+
+```mermaid
+flowchart LR
+  Browser[React dashboard] -->|admin bearer token| Gateway[Go gateway]
+  Client[API client] -->|X-API-Key| Gateway
+  Gateway -->|tenant-scoped metadata| Postgres[(PostgreSQL)]
+  Gateway -->|atomic token bucket| Redis[(Redis)]
+  Gateway -->|dynamic reverse proxy| Upstream[Mock upstream / API]
+  Gateway -->|structured JSON logs| Logs[stdout]
 ```
 
-## Repository Layout
+Request lifecycle:
 
-```text
-.
-├── backend/
-│   ├── cmd/
-│   │   ├── gateway/       # Gateway application entry point
-│   │   └── mockupstream/  # Local upstream test service
-│   └── internal/
-│       ├── analytics/     # Request metrics and logs
-│       ├── apikey/        # API-key validation
-│       ├── app/           # Application wiring
-│       ├── config/        # Runtime configuration
-│       ├── domain/        # Core models and contracts
-│       ├── httpapi/       # HTTP handlers and routes
-│       ├── middleware/    # Cross-cutting HTTP middleware
-│       ├── proxy/         # Upstream request forwarding
-│       ├── ratelimit/     # Traffic limiting
-│       └── repository/    # Persistence abstractions
-│           └── memory/    # In-memory implementations
-├── frontend/
-│   └── src/               # React dashboard source
-├── scripts/               # Development and automation scripts
-└── .github/               # GitHub workflows and configuration
+1. The gateway creates a request ID and looks up the API client by key prefix.
+2. The key hash and active status are verified.
+3. The client tenant is used to resolve an active route.
+4. Method policy and the client/route rate-limit policy are checked.
+5. Redis atomically refills and consumes a token, or the local mutex bucket is used without Redis.
+6. The request is forwarded without `X-API-Key` or `Authorization` headers.
+7. Status, latency, tenant, client, route, blocked state, and request ID are persisted.
+
+## Stack
+
+- Go 1.22, `net/http`, `httputil.ReverseProxy`, `log/slog`
+- PostgreSQL 16 for tenants, clients, routes, policies, and request logs
+- Redis 7 with an atomic Lua token-bucket script
+- React, TypeScript, Vite, TanStack Query, Recharts, Lucide
+- Docker Compose and GitHub Actions
+
+## Local setup
+
+Prerequisites: Go 1.22+, Node 20+, npm 10+, and Docker Desktop.
+
+```powershell
+Copy-Item .env.example .env
+docker compose up --build
 ```
 
-## Requirements
+Open the dashboard at `http://localhost:5173`. The gateway is at `http://localhost:8080` and the mock upstream is at `http://localhost:9090`.
 
-- Go 1.22 or later
-- Node.js 20 or later
-- npm 10 or later
+The default local values are:
 
-The frontend uses React, React Router, TanStack Query, Recharts, Lucide React, TypeScript, Vite, Tailwind CSS, and Vitest.
+- Admin token: `gateflow-local-admin`
+- Tenant ID: `local-tenant`
+- Demo API key: `gf_local_demo_key`
 
-## Getting Started
+Set `ADMIN_TOKEN` and `SEED_API_KEY` in `.env` for a different local installation. These values are development defaults only.
 
-### 1. Clone the repository
+Without Docker, run PostgreSQL and Redis separately, then start:
 
-```bash
-git clone https://github.com/ShaliniBangamuwage/GateFlow.git
-cd GateFlow
-```
-
-### 2. Restore the application source
-
-Before starting the services, ensure the repository contains:
-
-- `backend/go.mod`
-- Go source files under `backend/cmd` and `backend/internal`
-- `frontend/package.json`
-- Frontend source files under `frontend/src`
-
-These files are not present in the current checkout, so the commands below are the expected project workflow rather than executable commands for this snapshot.
-
-### 3. Start the gateway backend
-
-```bash
-cd backend
-go mod download
-go run ./cmd/gateway
-```
-
-### 4. Start the mock upstream in a second terminal
-
-```bash
+```powershell
 cd backend
 go run ./cmd/mockupstream
-```
-
-### 5. Start the frontend in a third terminal
-
-```bash
-cd frontend
+go run ./cmd/gateway
+cd ..\frontend
 npm ci
 npm run dev
 ```
 
-Open the local URL printed by Vite, normally `http://localhost:5173`.
+With `DATABASE_URL` and `REDIS_URL` unset, the gateway uses in-memory storage and a local token bucket, which is useful for fast unit tests.
 
-## Configuration
+## API endpoints
 
-Configuration is read from environment variables in the backend configuration package. Use an untracked `.env` file for local values and never commit secrets.
+Administrative endpoints require `Authorization: Bearer $ADMIN_TOKEN` and are tenant-scoped with `X-Tenant-ID`.
 
-The expected local configuration should define, as applicable:
+- `POST /api/tenants`
+- `GET, POST /api/clients`
+- `POST /api/clients/{id}/rotate-key`
+- `PATCH /api/clients/{id}/revoke`
+- `PATCH /api/clients/{id}/activate`
+- `PATCH /api/clients/{id}/rate-limit`
+- `GET, POST /api/routes`
+- `PATCH, DELETE /api/routes/{id}`
+- `GET /api/analytics/summary`
+- `GET /api/analytics/traffic`
+- `GET /api/analytics/logs`
+- `GET /health`
+- `GET /readyz` or `GET /ready`
 
-| Setting | Purpose | Example |
-| --- | --- | --- |
-| `PORT` | Gateway listen port | `8080` |
-| `UPSTREAM_URL` | Default upstream service URL | `http://localhost:8081` |
-| `API_KEY` | Development API key | `local-development-key` |
-| `VITE_API_URL` | Frontend API base URL | `http://localhost:8080` |
+Gateway traffic uses `X-API-Key` and a configured route, for example:
 
-The exact variable names and defaults should be confirmed against the restored backend configuration and frontend API client before deployment.
-
-## API Surface
-
-The dashboard is designed to communicate with the gateway through these resource areas:
-
-| Area | Purpose |
-| --- | --- |
-| `/api/analytics/summary` | Aggregated gateway metrics |
-| `/api/analytics/logs` | Recent request and proxy logs |
-| `/api/clients` | Client and API-key management |
-| `/api/routes` | Upstream route management |
-
-The final request methods, payload schemas, authentication headers, and response codes are defined by the restored HTTP handlers and should be treated as the source of truth.
-
-## Frontend Development
-
-Typical frontend commands after restoring `frontend/package.json` are:
-
-```bash
-npm ci
-npm run dev       # Start the Vite development server
-npm run build     # Create a production build
-npm run preview   # Preview the production build locally
-npm run test      # Run Vitest tests
-npm run lint      # Run ESLint
+```powershell
+curl.exe http://localhost:8080/gateway/products -H "X-API-Key: gf_local_demo_key"
 ```
 
-## Backend Development
+The seeded `/gateway` route forwards `/gateway/products` to the mock upstream's `/products` endpoint. The default client has a capacity of five tokens and refills at one token per second:
 
-From `backend/`:
+```powershell
+.\scripts\demo.ps1
+```
 
-```bash
+## Security decisions
+
+Raw API keys are returned only on creation or rotation. The database stores a prefix and SHA-256 digest of a cryptographically random 256-bit key; raw keys are never logged or proxied upstream. Admin APIs require a local bearer token and an existing `X-Tenant-ID`; repositories enforce that tenant boundary. Route URLs accept only HTTP(S) URLs with a host and production rejects private, loopback, link-local, and metadata destinations. Request bodies are capped at 1 MiB for JSON admin requests, and server/upstream timeouts are configured.
+
+This is a local MVP. Before production, replace the local admin token with OIDC/JWT and RBAC, add stronger SSRF egress policy, TLS, secret management, rate-limit policy administration, and operational alerting.
+
+## Database model
+
+`tenants` owns `api_clients`, `gateway_routes`, `rate_limit_policies`, and `request_logs`. Foreign keys and tenant-scoped repository queries prevent cross-tenant reads. Migrations are in `backend/migrations/001_init.sql`; raw API keys are intentionally absent from the schema.
+
+## Testing
+
+```powershell
+cd backend
 go test ./...
 go vet ./...
-go run ./cmd/gateway
-go run ./cmd/mockupstream
+cd ..\frontend
+npm ci
+npm run lint
+npm test -- --run
+npm run build
+cd ..
+docker compose config
 ```
 
-## Testing the Gateway Locally
+The GitHub Actions workflow runs backend formatting, vet, tests, and build; frontend lint, tests, and production build; and Compose configuration validation.
 
-1. Start the mock upstream service.
-2. Start the GateFlow gateway.
-3. Create or configure an API client and route.
-4. Send a request through the gateway using the configured API key.
-5. Confirm the upstream response is returned.
-6. Check the dashboard analytics and request logs.
-7. Send requests above the configured limit and verify rate limiting is applied.
+## Repository layout
 
-Example request shape:
+- `backend/cmd/gateway`: gateway executable and graceful shutdown
+- `backend/cmd/mockupstream`: local upstream service
+- `backend/internal/httpapi`: admin APIs, analytics, dynamic proxy lifecycle
+- `backend/internal/storage`: memory and PostgreSQL repositories
+- `backend/internal/ratelimit`: token bucket and Redis Lua limiter
+- `backend/migrations`: PostgreSQL schema and indexes
+- `frontend/src`: dashboard source and API client
+- `docker-compose.yml`: local five-service stack
+- `scripts/demo.ps1`: interview/demo request flow
 
-```bash
-curl http://localhost:8080/<gateway-route> -H "X-API-Key: <your-api-key>"
-```
+## Future AWS mapping
 
-Replace `<gateway-route>` and `<your-api-key>` with values from the running application.
-
-## Production Considerations
-
-- Store API keys and upstream credentials in a secrets manager.
-- Use HTTPS between clients, GateFlow, and upstream services.
-- Replace in-memory repositories with durable storage before production use.
-- Configure rate limits per client and route.
-- Restrict administrative endpoints behind authentication and network controls.
-- Set structured logging and monitoring for gateway errors, latency, and rejected requests.
-- Build and serve the frontend from a controlled deployment pipeline.
-
-## Contributing
-
-1. Create a focused branch from `main`.
-2. Make the smallest change that addresses the issue.
-3. Add or update tests for behavior changes.
-4. Run the backend and frontend checks locally.
-5. Open a pull request with a clear description and validation notes.
-
-## License
-
-No license file is currently included. Add a license before distributing GateFlow publicly.
-
-## Maintainer
-
-[Shalini Bangamuwage](https://github.com/ShaliniBangamuwage)
+The local boundaries map directly to ECR images, ECS Fargate services, RDS PostgreSQL, ElastiCache Redis, CloudWatch logs/metrics, Secrets Manager, an Application Load Balancer, and GitHub Actions using AWS OIDC. AWS deployment is intentionally not part of this MVP.
