@@ -1,16 +1,17 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Activity, ArrowUpRight, BarChart3, Copy, KeyRound, LayoutDashboard, Plus, RefreshCw, Route as RouteIcon, ShieldAlert, Trash2, Users, X } from 'lucide-react'
+import { Activity, ArrowUpRight, BarChart3, Bot, Copy, KeyRound, LayoutDashboard, Plus, RefreshCw, Route as RouteIcon, ShieldAlert, Trash2, Users, X } from 'lucide-react'
 import { Bar, BarChart, CartesianGrid, Line, LineChart, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import { api, Client, Route } from './api'
+import AIInsights from './components/dashboard/AIInsights'
 
-type Page = 'overview' | 'clients' | 'routes' | 'logs'
-const nav: { id: Page; label: string; icon: typeof Activity }[] = [{ id: 'overview', label: 'Overview', icon: LayoutDashboard }, { id: 'clients', label: 'API clients', icon: Users }, { id: 'routes', label: 'Routes', icon: RouteIcon }, { id: 'logs', label: 'Traffic logs', icon: Activity }]
+type Page = 'overview' | 'clients' | 'routes' | 'logs' | 'ai'
+const nav: { id: Page; label: string; icon: typeof Activity }[] = [{ id: 'overview', label: 'Overview', icon: LayoutDashboard }, { id: 'clients', label: 'API clients', icon: Users }, { id: 'routes', label: 'Routes', icon: RouteIcon }, { id: 'logs', label: 'Traffic logs', icon: Activity }, { id: 'ai', label: 'AI insights', icon: Bot }]
 
 export default function App() {
   const [page, setPage] = useState<Page>('overview')
   const [error, setError] = useState('')
-  return <div className="app-shell"><aside className="sidebar"><div className="brand"><div className="brand-mark">G</div><div><strong>GateFlow</strong><small>LOCAL CONTROL PLANE</small></div></div><nav>{nav.map(item => { const Icon = item.icon; return <button className={page === item.id ? 'nav-item active' : 'nav-item'} key={item.id} onClick={() => setPage(item.id)}><Icon size={17} />{item.label}</button> })}</nav><div className="sidebar-foot"><span className="status-dot" /> Gateway local<br /><small>Tenant: local-tenant</small></div></aside><main className="content"><header className="topbar"><div><span className="eyebrow">OPERATIONS CONSOLE</span><h1>{nav.find(item => item.id === page)?.label}</h1></div><div className="topbar-status"><span className="status-dot" /> Connected <button className="icon-button" title="Refresh data" onClick={() => window.location.reload()}><RefreshCw size={16} /></button></div></header>{error && <div className="error-banner"><ShieldAlert size={17} />{error}<button className="icon-button" onClick={() => setError('')}><X size={16} /></button></div>}{page === 'overview' && <Overview onError={setError} />}{page === 'clients' && <Clients onError={setError} />}{page === 'routes' && <Routes onError={setError} />}{page === 'logs' && <Logs onError={setError} />}</main></div>
+  return <div className="app-shell"><aside className="sidebar"><div className="brand"><div className="brand-mark">G</div><div><strong>GateFlow</strong><small>LOCAL CONTROL PLANE</small></div></div><nav>{nav.map(item => { const Icon = item.icon; return <button className={page === item.id ? 'nav-item active' : 'nav-item'} key={item.id} onClick={() => setPage(item.id)}><Icon size={17} />{item.label}</button> })}</nav><div className="sidebar-foot"><span className="status-dot" /> Gateway local<br /><small>Tenant: local-tenant</small></div></aside><main className="content"><header className="topbar"><div><span className="eyebrow">OPERATIONS CONSOLE</span><h1>{nav.find(item => item.id === page)?.label}</h1></div><div className="topbar-status"><span className="status-dot" /> Connected <button className="icon-button" title="Refresh data" onClick={() => window.location.reload()}><RefreshCw size={16} /></button></div></header>{error && <div className="error-banner"><ShieldAlert size={17} />{error}<button className="icon-button" onClick={() => setError('')}><X size={16} /></button></div>}{page === 'overview' && <Overview onError={setError} />}{page === 'clients' && <Clients onError={setError} />}{page === 'routes' && <Routes onError={setError} />}{page === 'logs' && <Logs onError={setError} />}{page === 'ai' && <AIInsights />}</main></div>
 }
 
 function Overview({ onError }: { onError: (value: string) => void }) {

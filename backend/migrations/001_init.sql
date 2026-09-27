@@ -66,3 +66,31 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_policies_scope ON rate_limit_policies(tena
 CREATE INDEX IF NOT EXISTS idx_logs_tenant_created ON request_logs(tenant_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_logs_client ON request_logs(client_id);
 CREATE INDEX IF NOT EXISTS idx_logs_route ON request_logs(route_id);
+
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE IF NOT EXISTS knowledge_chunks (
+    id BIGSERIAL PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    source_type TEXT NOT NULL DEFAULT 'document',
+    source_id TEXT NOT NULL,
+    source_name TEXT NOT NULL,
+    section TEXT NOT NULL DEFAULT 'Document',
+    content TEXT NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    metadata JSONB NOT NULL DEFAULT '{}',
+    embedding VECTOR(384) NOT NULL,
+    content_hash TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (tenant_id, source_type, source_id, content_hash, chunk_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_tenant_id
+    ON knowledge_chunks (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_source_id
+    ON knowledge_chunks (tenant_id, source_id);
+CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_source_type
+    ON knowledge_chunks (tenant_id, source_type);
+CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_lookup
+    ON knowledge_chunks (tenant_id, source_id, content_hash, chunk_index);

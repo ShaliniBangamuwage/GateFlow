@@ -1,8 +1,11 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"io"
 	"log/slog"
@@ -13,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	jwt "github.com/golang-jwt/jwt/v5"
 
 	"gateflow/internal/apikey"
 	"gateflow/internal/config"
@@ -27,13 +32,18 @@ type Server struct {
 	limiter       ratelimit.Limiter
 	logger        *slog.Logger
 	defaultTenant string
+	aiClient      *http.Client
 }
 
 func NewServer(cfg config.Config, store storage.Store, limiter ratelimit.Limiter, logger *slog.Logger, defaultTenant string) *Server {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	return &Server{cfg: cfg, store: store, limiter: limiter, logger: logger, defaultTenant: defaultTenant}
+	timeout := time.Duration(cfg.AIServiceTimeoutMS) * time.Millisecond
+	if timeout <= 0 {
+		timeout = 8 * time.Second
+	}
+	return &Server{cfg: cfg, store: store, limiter: limiter, logger: logger, defaultTenant: defaultTenant, aiClient: &http.Client{Timeout: timeout}}
 }
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -79,9 +89,17 @@ func (s *Server) cors(next http.Handler) http.Handler {
 }
 func (s *Server) adminAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		value := r.Header.Get("Authorization")
-		if value != "Bearer "+s.cfg.AdminToken {
+		principal, ok := s.authenticateAdmin(r)
+		if !ok {
 			writeJSON(w, 401, map[string]string{"error": "UNAUTHORIZED", "message": "Administrator authentication required."})
+			return
+		}
+		if !principal.hasRequiredRole(r.Method) {
+			writeJSON(w, 403, map[string]string{"error": "FORBIDDEN", "message": "Insufficient administrator role."})
+			return
+		}
+		if !principal.local && principal.tenantID != s.tenantID(r) {
+			writeJSON(w, 403, map[string]string{"error": "FORBIDDEN", "message": "Token is not authorized for the requested tenant."})
 			return
 		}
 		path := strings.TrimPrefix(r.URL.Path, "/api/")
@@ -99,6 +117,95 @@ func (s *Server) adminAuth(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+type adminPrincipal struct {
+	role     string
+	tenantID string
+	local    bool
+}
+
+func (p adminPrincipal) hasRequiredRole(method string) bool {
+	if p.local || p.role == "admin" {
+		return true
+	}
+	if p.role == "viewer" {
+		return method == http.MethodGet
+	}
+	return false
+}
+
+func (s *Server) authenticateAdmin(r *http.Request) (adminPrincipal, bool) {
+	value := r.Header.Get("Authorization")
+	if !strings.HasPrefix(value, "Bearer ") {
+		return adminPrincipal{}, false
+	}
+	tokenValue := strings.TrimPrefix(value, "Bearer ")
+	if s.cfg.Environment != "production" && tokenValue == s.cfg.AdminToken {
+		return adminPrincipal{local: true}, true
+	}
+	if s.cfg.AdminJWTIssuer == "" || s.cfg.AdminJWTPublicKey == "" {
+		return adminPrincipal{}, false
+	}
+	publicKey, err := parsePublicKey(s.cfg.AdminJWTPublicKey)
+	if err != nil {
+		return adminPrincipal{}, false
+	}
+	parsed, err := jwt.Parse(tokenValue, func(token *jwt.Token) (any, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodRSA); !ok {
+			return nil, errors.New("unexpected signing method")
+		}
+		return publicKey, nil
+	})
+	if err != nil || !parsed.Valid {
+		return adminPrincipal{}, false
+	}
+	claims, ok := parsed.Claims.(jwt.MapClaims)
+	if !ok {
+		return adminPrincipal{}, false
+	}
+	issuer, _ := claims.GetIssuer()
+	if issuer != s.cfg.AdminJWTIssuer {
+		return adminPrincipal{}, false
+	}
+	audience, err := claims.GetAudience()
+	if err != nil || len(audience) == 0 || !containsAudience(audience, s.cfg.AdminJWTAudience) {
+		return adminPrincipal{}, false
+	}
+	exp, err := claims.GetExpirationTime()
+	if err != nil || exp == nil || time.Until(exp.Time) <= 0 {
+		return adminPrincipal{}, false
+	}
+	role, _ := claims[s.cfg.AdminRoleClaim].(string)
+	tenantID, _ := claims[s.cfg.AdminTenantClaim].(string)
+	if strings.TrimSpace(tenantID) == "" {
+		return adminPrincipal{}, false
+	}
+	return adminPrincipal{role: strings.ToLower(role), tenantID: tenantID}, true
+}
+
+func containsAudience(values jwt.ClaimStrings, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func parsePublicKey(value string) (any, error) {
+	block, _ := pem.Decode([]byte(value))
+	if block == nil {
+		return nil, errors.New("invalid PEM")
+	}
+	if block.Type != "PUBLIC KEY" && block.Type != "RSA PUBLIC KEY" {
+		return nil, errors.New("unsupported public key format")
+	}
+	key, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err == nil {
+		return key, nil
+	}
+	return x509.ParsePKCS1PublicKey(block.Bytes)
 }
 func (s *Server) tenantID(r *http.Request) string {
 	if value := r.Header.Get("X-Tenant-ID"); value != "" {
@@ -125,9 +232,178 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		s.traffic(w, r)
 	case path == "analytics/logs":
 		s.logs(w, r)
+	case path == "ai/anomalies":
+		s.aiAnomalies(w, r)
+	case path == "ai/overview", path == "ai/recent-anomalies", path == "ai/forecast", path == "ai/assistant", path == "ai/incident-analysis":
+		s.aiDashboardProxy(w, r, strings.TrimPrefix(path, "ai/"))
 	default:
 		writeJSON(w, 404, map[string]string{"error": "NOT_FOUND"})
 	}
+}
+
+// aiAnomalies forwards only an allowlisted set of filters and the tenant
+// resolved by Go's authenticated admin boundary. Browser-supplied tenant IDs
+// never reach the AI service as trusted identity.
+func (s *Server) aiAnomalies(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "METHOD_NOT_ALLOWED"})
+		return
+	}
+	if strings.TrimSpace(s.cfg.AIServiceURL) == "" || strings.TrimSpace(s.cfg.AIServiceToken) == "" {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "AI_SERVICE_UNAVAILABLE"})
+		return
+	}
+	base, err := url.Parse(strings.TrimRight(s.cfg.AIServiceURL, "/"))
+	if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "AI_SERVICE_UNAVAILABLE"})
+		return
+	}
+	target := base.ResolveReference(&url.URL{Path: "/api/ai/anomalies"})
+	query := url.Values{}
+	query.Set("tenant_id", s.tenantID(r))
+	for _, key := range []string{"start_time", "end_time", "client_id", "route_id", "limit"} {
+		if value := r.URL.Query().Get(key); value != "" {
+			query.Set(key, value)
+		}
+	}
+	target.RawQuery = query.Encode()
+	request, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target.String(), nil)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "AI_SERVICE_UNAVAILABLE"})
+		return
+	}
+	request.Header.Set("Authorization", "Bearer "+s.cfg.AIServiceToken)
+	request.Header.Set("Accept", "application/json")
+	response, err := s.aiClient.Do(request)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "AI_SERVICE_UNAVAILABLE"})
+		return
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusBadRequest || response.StatusCode == http.StatusUnprocessableEntity {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "INVALID_AI_REQUEST"})
+		return
+	}
+	if response.StatusCode != http.StatusOK {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "AI_SERVICE_UNAVAILABLE"})
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, (2<<20)+1))
+	if err != nil || len(body) > 2<<20 {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "INVALID_AI_RESPONSE"})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+}
+
+func (s *Server) aiDashboardProxy(w http.ResponseWriter, r *http.Request, route string) {
+	if route == "assistant" {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "METHOD_NOT_ALLOWED"})
+			return
+		}
+	} else if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "METHOD_NOT_ALLOWED"})
+		return
+	}
+	if strings.TrimSpace(s.cfg.AIServiceURL) == "" || strings.TrimSpace(s.cfg.AIServiceToken) == "" {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "AI_SERVICE_UNAVAILABLE"})
+		return
+	}
+	base, err := url.Parse(strings.TrimRight(s.cfg.AIServiceURL, "/"))
+	if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "AI_SERVICE_UNAVAILABLE"})
+		return
+	}
+	target := base.ResolveReference(&url.URL{Path: "/api/ai/" + route})
+	if route == "assistant" {
+		var payload struct {
+			Question string `json:"question"`
+		}
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10))
+		if err := decoder.Decode(&payload); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "INVALID_AI_REQUEST"})
+			return
+		}
+		var trailing any
+		if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "INVALID_AI_REQUEST"})
+			return
+		}
+		question := strings.TrimSpace(payload.Question)
+		if question == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "INVALID_AI_REQUEST"})
+			return
+		}
+		forwardPayload := map[string]string{"tenant_id": s.tenantID(r), "question": question}
+		body, err := json.Marshal(forwardPayload)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "INVALID_AI_REQUEST"})
+			return
+		}
+		request, err := http.NewRequestWithContext(r.Context(), http.MethodPost, target.String(), bytes.NewReader(body))
+		if err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "AI_SERVICE_UNAVAILABLE"})
+			return
+		}
+		request.Header.Set("Authorization", "Bearer "+s.cfg.AIServiceToken)
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Accept", "application/json")
+		response, err := s.aiClient.Do(request)
+		if err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "AI_SERVICE_UNAVAILABLE"})
+			return
+		}
+		defer response.Body.Close()
+		if response.StatusCode >= 400 {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "AI_SERVICE_UNAVAILABLE"})
+			return
+		}
+		bodyResp, err := io.ReadAll(io.LimitReader(response.Body, (2<<20)+1))
+		if err != nil || len(bodyResp) > 2<<20 {
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "INVALID_AI_RESPONSE"})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(bodyResp)
+		return
+	}
+	query := url.Values{}
+	query.Set("tenant_id", s.tenantID(r))
+	for _, key := range []string{"start_time", "end_time", "client_id", "route_id", "limit"} {
+		if value := r.URL.Query().Get(key); value != "" {
+			query.Set(key, value)
+		}
+	}
+	target.RawQuery = query.Encode()
+	request, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target.String(), nil)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "AI_SERVICE_UNAVAILABLE"})
+		return
+	}
+	request.Header.Set("Authorization", "Bearer "+s.cfg.AIServiceToken)
+	request.Header.Set("Accept", "application/json")
+	response, err := s.aiClient.Do(request)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "AI_SERVICE_UNAVAILABLE"})
+		return
+	}
+	defer response.Body.Close()
+	if response.StatusCode >= 400 {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "AI_SERVICE_UNAVAILABLE"})
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, (2<<20)+1))
+	if err != nil || len(body) > 2<<20 {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "INVALID_AI_RESPONSE"})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
 }
 func (s *Server) tenants(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {

@@ -1,0 +1,8 @@
+fastapi==0.115.12
+uvicorn[standard]==0.34.0
+numpy==2.2.3
+pandas==2.2.3
+psycopg[binary]==3.2.6
+scikit-learn==1.6.1
+joblib==1.6.0
+fastembed==0.8.1

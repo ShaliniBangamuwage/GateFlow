@@ -2,6 +2,8 @@
 
 GateFlow is a local multi-tenant API gateway MVP. It authenticates API clients, resolves tenant-scoped routes, applies local or Redis-backed token-bucket limits, proxies traffic, records safe request metadata, and exposes a React operations dashboard.
 
+The optional internal Python AI service currently provides bounded tenant-scoped traffic extraction, minute-level feature engineering, synthetic dataset generation, offline anomaly-model training/evaluation, and authenticated anomaly inference. It remains outside the gateway proxy path. The AI service is not yet a complete AI platform: forecasting, embeddings/RAG/LLM, anomaly persistence, and dashboard integration remain future work. See [the AI learning guide](docs/ai-learning-guide.md) for exact implementation status.
+
 ## Architecture
 
 ```mermaid
@@ -49,7 +51,7 @@ The default local values are:
 - Tenant ID: `local-tenant`
 - Demo API key: `gf_local_demo_key`
 
-Set `ADMIN_TOKEN` and `SEED_API_KEY` in `.env` for a different local installation. These values are development defaults only.
+Set `ADMIN_TOKEN` and `SEED_API_KEY` in `.env` for a different local installation. These values are development defaults only. The optional AI service uses `AI_SERVICE_TOKEN` for private Go-to-AI calls.
 
 Without Docker, run PostgreSQL and Redis separately, then start:
 
@@ -66,7 +68,7 @@ With `DATABASE_URL` and `REDIS_URL` unset, the gateway uses in-memory storage an
 
 ## API endpoints
 
-Administrative endpoints require `Authorization: Bearer $ADMIN_TOKEN` and are tenant-scoped with `X-Tenant-ID`.
+Administrative endpoints require a bearer token and are tenant-scoped with `X-Tenant-ID`. In development, `ADMIN_TOKEN` remains available for local use. In production, configure `ADMIN_JWT_ISSUER`, `ADMIN_JWT_AUDIENCE`, and `ADMIN_JWT_PUBLIC_KEY` (PEM-encoded RSA public key); JWTs must have a valid signature, issuer, audience, expiry, role claim (`ADMIN_ROLE_CLAIM`, default `role`), and tenant claim (`ADMIN_TENANT_CLAIM`, default `tenant_id`) matching `X-Tenant-ID`. The `admin` role can mutate and read; `viewer` can only make GET requests. Static local admin tokens are rejected when `APP_ENV=production`.
 
 - `POST /api/tenants`
 - `GET, POST /api/clients`
@@ -79,6 +81,7 @@ Administrative endpoints require `Authorization: Bearer $ADMIN_TOKEN` and are te
 - `GET /api/analytics/summary`
 - `GET /api/analytics/traffic`
 - `GET /api/analytics/logs`
+- `GET /api/ai/anomalies` (internal model-backed route; returns 503 until an active model artifact is explicitly promoted)
 - `GET /health`
 - `GET /readyz` or `GET /ready`
 
@@ -96,9 +99,9 @@ The seeded `/gateway` route forwards `/gateway/products` to the mock upstream's 
 
 ## Security decisions
 
-Raw API keys are returned only on creation or rotation. The database stores a prefix and SHA-256 digest of a cryptographically random 256-bit key; raw keys are never logged or proxied upstream. Admin APIs require a local bearer token and an existing `X-Tenant-ID`; repositories enforce that tenant boundary. Route URLs accept only HTTP(S) URLs with a host and production rejects private, loopback, link-local, and metadata destinations. Request bodies are capped at 1 MiB for JSON admin requests, and server/upstream timeouts are configured.
+Raw API keys are returned only on creation or rotation. The database stores a prefix and SHA-256 digest of a cryptographically random 256-bit key; raw keys are never logged or proxied upstream. Admin APIs require a bearer token and an existing tenant; development supports a local token, while production can validate configured RSA JWTs with role and tenant claims. Route URLs accept only HTTP(S) URLs with a host and production rejects private, loopback, link-local, and metadata destinations. Request bodies are capped at 1 MiB for JSON admin requests, and server/upstream timeouts are configured.
 
-This is a local MVP. Before production, replace the local admin token with OIDC/JWT and RBAC, add stronger SSRF egress policy, TLS, secret management, rate-limit policy administration, and operational alerting.
+This is a local MVP. Production JWT validation and backend `admin`/`viewer` role enforcement are available when configured, but the application does not implement an OIDC login flow or key discovery/rotation; provision trusted public keys out of band. Before production, add stronger SSRF egress policy, TLS, secret management, rate-limit policy administration, and operational alerting.
 
 ## Database model
 

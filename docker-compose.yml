@@ -1,10 +1,12 @@
 services:
   postgres:
-    image: postgres:16-alpine
+    image: pgvector/pgvector:pg16
     environment:
       POSTGRES_DB: gateflow
       POSTGRES_USER: gateflow
       POSTGRES_PASSWORD: gateflow-local-password
+    ports:
+      - "5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -34,6 +36,26 @@ services:
       timeout: 3s
       retries: 10
 
+  ai-service:
+    build: ./ai-service
+    environment:
+      AI_DATABASE_URL: ${AI_DATABASE_URL:-postgres://gateflow:gateflow-local-password@postgres:5432/gateflow?sslmode=disable}
+      AI_SERVICE_TOKEN: ${AI_SERVICE_TOKEN:-gateflow-ai-local-internal}
+      ANOMALY_MODEL_PATH: /app/models/active
+    volumes:
+      - ai-models:/app/models
+    expose:
+      - "8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/ready', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
   gateway:
     build:
       context: ./backend
@@ -41,6 +63,9 @@ services:
     environment:
       PORT: 8080
       ADMIN_TOKEN: ${ADMIN_TOKEN:-gateflow-local-admin}
+      AI_SERVICE_URL: http://ai-service:8000
+      AI_SERVICE_TOKEN: ${AI_SERVICE_TOKEN:-gateflow-ai-local-internal}
+      AI_SERVICE_TIMEOUT_MS: 8000
       SEED_API_KEY: ${SEED_API_KEY:-gf_local_demo_key}
       DATABASE_URL: postgres://gateflow:gateflow-local-password@postgres:5432/gateflow?sslmode=disable
       REDIS_URL: redis://redis:6379/0
@@ -71,3 +96,4 @@ services:
 
 volumes:
   postgres-data:
+  ai-models:
